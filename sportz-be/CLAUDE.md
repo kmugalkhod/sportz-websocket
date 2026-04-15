@@ -1,0 +1,116 @@
+# sportz-websocket Development Guidelines
+
+Auto-generated from feature plans. Last updated: 2026-04-13
+
+## What This Project Is
+
+**Live Cricket Commentary Platform** — backend Node.js service that polls Cricbuzz (via RapidAPI) for live ball-by-ball data and broadcasts it in real-time to fans connected via WebSocket.
+
+```
+Cricbuzz API (RapidAPI) → Node.js backend → WebSocket → Fans
+     REST polling                               push
+     every 15–30s                            instantly
+```
+
+## Active Technologies
+
+- **Runtime**: Node.js LTS (v20+), ESM (`"type": "module"`)
+- **Web framework**: Express v5
+- **WebSocket**: `ws` library, `noServer: true`
+- **Database**: PostgreSQL via Neon (managed), `pg.Pool` + `drizzle-orm/node-postgres`
+- **Validation**: Zod (REST request validation)
+- **Security**: ArcJet (rate limiting + bot detection)
+- **Data source**: Cricbuzz Cricket API via RapidAPI (REST polling)
+- **Config**: `dotenv`
+
+## Project Structure
+
+```
+src/
+├── index.js                 # Entry: http.Server wraps Express + WebSocketServer
+├── health.js                # GET /health — WS clients, DB pool, poller status
+├── db/
+│   ├── db.js                # pg.Pool + drizzle instance
+│   └── schema.js            # matches + commentary tables
+├── adapters/
+│   └── cricbuzz.js          # Polls Cricbuzz every 15–30s; deduplicates; calls publishEvent()
+├── websocket/
+│   ├── server.js            # WebSocketServer (noServer: true)
+│   ├── handlers.js          # Message router: subscribe / unsubscribe / ping
+│   ├── registry.js          # Map<matchId, Set<WebSocket>>
+│   ├── heartbeat.js         # 15s ping/pong; ws.terminate() on ghost
+│   └── broadcaster.js       # broadcastToMatch() + bufferedAmount backpressure
+├── routes/
+│   ├── matches.js           # GET /api/matches, GET /api/matches/:id
+│   └── events.js            # GET /api/matches/:id/events
+├── middleware/
+│   ├── arcjet.js            # ArcJet singleton + Express middleware
+│   └── validate.js          # Zod wrapper
+└── services/
+    └── commentary.js        # publishEvent(): DB insert → broadcastToMatch()
+
+tests/
+├── unit/                    # registry, heartbeat, broadcaster, cricbuzz adapter
+└── integration/             # WebSocket flows, REST endpoints
+```
+
+## Commands
+
+```bash
+npm run dev          # Start with file watching
+npm start            # Production start
+npm test             # Jest (--experimental-vm-modules for ESM)
+npm run db:generate  # Generate Drizzle migration SQL
+npm run db:migrate   # Apply migrations to Neon
+npm run db:studio    # Schema browser at local.drizzle.studio
+```
+
+## Environment Variables
+
+```bash
+DATABASE_URL=        # Neon pooler endpoint (not direct)
+RAPIDAPI_KEY=        # Cricbuzz via RapidAPI — NEVER expose to browser
+ARCJET_KEY=          # ArcJet
+ARCJET_ENV=development  # Remove in production
+PORT=8000
+POLL_INTERVAL_MS=15000  # Cricbuzz polling interval
+```
+
+## Key Architecture Rules
+
+1. **REST and WebSocket share one port** — `http.createServer(app)` + `noServer: true`
+2. **ArcJet must intercept `upgrade` event** — not `ws.on('connection')`. Use `noServer: true`.
+3. **Broadcast AFTER DB write** — never inside a transaction
+4. **Deduplication is mandatory** — track `lastSeenBall` per match using `overSep.balls` from Cricbuzz. Same ball must never broadcast twice.
+5. **`ws.terminate()` not `ws.close()`** — for forced cleanup of ghost connections
+6. **Check `ws.readyState` and `ws.bufferedAmount`** before every send
+7. **`sequence` is the reconnect cursor** — not `createdAt`. Composite index `(matchId, sequence)` is the hot path.
+8. **`RAPIDAPI_KEY` is server-side only** — never referenced in any client-facing code
+9. **Neon pooler endpoint** — not the direct endpoint. Append `?sslmode=require`.
+10. **Polling only runs for `live` matches** — check `status = 'live'` before starting a poller
+
+## Cricket-Specific Notes
+
+- Match formats: T20, ODI, TEST
+- Innings periods: `1ST_INN`, `2ND_INN`, `SUPER_OVER`
+- Over notation: `"15.4"` = over 15, ball 4
+- Tournaments covered (free): IPL, ICC World Cup, bilateral series
+- No live matches in off-season — use seed script for development
+
+## Spec Documents
+
+```
+specs/001-live-sports-commentary-platform/
+├── spec.md              # Feature requirements
+├── plan.md              # Implementation plan + architecture decisions
+├── research.md          # Data source research + Cricbuzz API details
+├── data-model.md        # DB schema + cricket event types
+├── quickstart.md        # Setup guide
+├── contracts/
+│   ├── websocket-protocol.md  # WS message schemas
+│   └── rest-api.md            # REST endpoint contracts
+└── tasks.md             # TDD tasks (generated by /speckit.tasks)
+```
+
+<!-- MANUAL ADDITIONS START -->
+<!-- MANUAL ADDITIONS END -->
