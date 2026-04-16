@@ -211,3 +211,119 @@ export async function startPollingAllLiveMatches() {
     }));
   }
 }
+
+// syncLiveMatches — auto-discovers live matches from Cricbuzz and upserts them into the DB
+// Called on startup and every SYNC_INTERVAL_MS (default 5 min)
+export async function syncLiveMatches() {
+  try {
+    const rawMatches = await fetchLiveMatches();
+    console.log(JSON.stringify({
+      level: 'info',
+      message: `syncLiveMatches: found ${rawMatches.length} live match(es) on Cricbuzz`,
+      timestamp: new Date().toISOString(),
+    }));
+
+    for (const raw of rawMatches) {
+      try {
+        const info  = raw.matchInfo;
+        const score = raw.matchScore;
+        if (!info?.matchId) continue;
+
+        const cricbuzzMatchId = info.matchId;
+        const homeTeam  = info.team1?.teamSName ?? info.team1?.teamName ?? 'TBD';
+        const awayTeam  = info.team2?.teamSName ?? info.team2?.teamName ?? 'TBD';
+        const series    = info.seriesName ?? null;
+        const format    = normalizeFormat(info.matchFormat);
+        const venue     = info.venue ? `${info.venue.name}, ${info.venue.city}` : null;
+        const startTime = info.startDate ? new Date(parseInt(info.startDate, 10)) : new Date();
+
+        // Extract scores from matchScore
+        const inn1 = score?.team1Score?.inngs1;
+        const inn2 = score?.team2Score?.inngs1;
+        const homeScore   = inn1?.runs    ?? 0;
+        const homeWickets = inn1?.wickets ?? 0;
+        const homeOvers   = inn1?.overs   != null ? String(inn1.overs) : '0.0';
+        const awayScore   = inn2?.runs    ?? 0;
+        const awayWickets = inn2?.wickets ?? 0;
+        const awayOvers   = inn2?.overs   != null ? String(inn2.overs) : '0.0';
+
+        // Upsert into DB (insert if new, update scores if already exists)
+        const { sql } = await import('drizzle-orm');
+        const result = await db.execute(sql`
+          INSERT INTO matches
+            (sport, home_team, away_team, series_name, match_format, venue,
+             status, cricbuzz_match_id, start_time,
+             home_score, home_wickets, home_overs,
+             away_score, away_wickets, away_overs)
+          VALUES
+            ('cricket', ${homeTeam}, ${awayTeam}, ${series}, ${format}, ${venue},
+             'live', ${cricbuzzMatchId}, ${startTime},
+             ${homeScore}, ${homeWickets}, ${homeOvers},
+             ${awayScore}, ${awayWickets}, ${awayOvers})
+          ON CONFLICT (cricbuzz_match_id) DO UPDATE
+            SET status        = 'live',
+                home_score    = EXCLUDED.home_score,
+                home_wickets  = EXCLUDED.home_wickets,
+                home_overs    = EXCLUDED.home_overs,
+                away_score    = EXCLUDED.away_score,
+                away_wickets  = EXCLUDED.away_wickets,
+                away_overs    = EXCLUDED.away_overs
+          RETURNING id, cricbuzz_match_id, home_team, away_team
+        `);
+
+        const row = result.rows?.[0];
+        if (!row) continue;
+
+        const internalId = row.id;
+        console.log(JSON.stringify({
+          level: 'info',
+          message: 'syncLiveMatches: upserted match',
+          internalId,
+          cricbuzzMatchId,
+          match: `${homeTeam} vs ${awayTeam}`,
+          timestamp: new Date().toISOString(),
+        }));
+
+        // Start polling if not already active
+        startPolling(internalId, cricbuzzMatchId);
+      } catch (matchErr) {
+        console.error(JSON.stringify({
+          level: 'error',
+          message: 'syncLiveMatches: failed to upsert match',
+          error: matchErr.message,
+          timestamp: new Date().toISOString(),
+        }));
+      }
+    }
+  } catch (err) {
+    console.error(JSON.stringify({
+      level: 'error',
+      message: 'syncLiveMatches: failed to fetch live matches',
+      error: err.message,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+}
+
+function normalizeFormat(raw) {
+  if (!raw) return null;
+  const upper = raw.toUpperCase();
+  if (upper.includes('TEST')) return 'TEST';
+  if (upper.includes('ODI')) return 'ODI';
+  if (upper.includes('T20') || upper.includes('TWENTY')) return 'T20';
+  return raw;
+}
+
+// Periodic sync — call this after server starts
+const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS ?? '300000', 10); // default 5 min
+let syncIntervalId = null;
+
+export function startSyncInterval() {
+  if (syncIntervalId) return;
+  syncIntervalId = setInterval(syncLiveMatches, SYNC_INTERVAL_MS);
+  console.log(JSON.stringify({
+    level: 'info',
+    message: `Live match sync scheduled every ${SYNC_INTERVAL_MS / 1000}s`,
+    timestamp: new Date().toISOString(),
+  }));
+}

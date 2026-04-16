@@ -35,10 +35,14 @@ server.on('upgrade', async (req, socket, head) => {
 server.on('listening', async () => {
   const { setupWebSocket } = await import('./websocket/server.js');
   const { startHeartbeat } = await import('./websocket/heartbeat.js');
-  const { startPollingAllLiveMatches } = await import('./adapters/cricbuzz.js');
+  const { startPollingAllLiveMatches, syncLiveMatches, startSyncInterval } = await import('./adapters/cricbuzz.js');
   setupWebSocket(server);
   startHeartbeat(wss);
+  // Poll matches already in the DB
   await startPollingAllLiveMatches();
+  // Auto-discover new live matches from Cricbuzz, then sync every 5 min
+  await syncLiveMatches();
+  startSyncInterval();
 });
 
 // Only bind the port when running as the main entry point — not when imported by tests
