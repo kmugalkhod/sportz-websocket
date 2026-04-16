@@ -82,18 +82,32 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   useEffect(() => {
     unmountedRef.current = false;
-    connect();
+
+    // Defer by one macrotask so React 19 Strict Mode's synchronous
+    // mount→unmount→remount cycle completes before we create the socket.
+    // On the real (second) mount the timeout fires and the socket is created.
+    // On the Strict Mode phantom mount the timeout is cancelled in cleanup
+    // before it fires, so no socket is ever created for the phantom mount.
+    const initTimeout = setTimeout(connect, 0);
 
     return () => {
-      // Mark as unmounted FIRST so onclose doesn't schedule a reconnect
       unmountedRef.current = true;
+      clearTimeout(initTimeout);
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      // Force-close any in-progress connection
+
       const ws = wsRef.current;
-      if (ws) {
-        wsRef.current = null;
-        ws.close();
-      }
+      wsRef.current = null;
+      if (!ws) return;
+
+      // Silence all handlers to prevent stale-closure side-effects
+      ws.onopen    = null;
+      ws.onmessage = null;
+      ws.onerror   = null;
+      ws.onclose   = null;
+
+      // Only call close() on an already-open socket — avoids the
+      // "closed before connection established" browser error
+      if (ws.readyState === WebSocket.OPEN) ws.close();
     };
   }, [connect]);
 
