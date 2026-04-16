@@ -144,12 +144,22 @@ let lastPollTimestamp = null;
 export function startPolling(internalMatchId, cricbuzzMatchId) {
   if (activePollers.has(internalMatchId)) return; // already polling
 
+  // Skip dummy/seeded IDs that can never resolve on Cricbuzz
+  if (!cricbuzzMatchId || cricbuzzMatchId === 99999) {
+    console.log(JSON.stringify({ level: 'warn', message: 'skip_poll_dummy_id', internalMatchId, cricbuzzMatchId, timestamp: new Date().toISOString() }));
+    return;
+  }
+
+  let consecutiveErrors = 0;
+  const MAX_ERRORS = 5;
+
   const interval = setInterval(async () => {
     const matchId = internalMatchId;
     console.log(JSON.stringify({ level: 'info', message: 'poll_start', matchId, timestamp: new Date().toISOString() }));
     try {
       const list = await fetchCommentary(cricbuzzMatchId);
       lastPollTimestamp = new Date().toISOString();
+      consecutiveErrors = 0; // reset on success
       if (!list.length) return;
       const latest = list[0];
       const ballKey = latest.overSep?.balls;
@@ -158,7 +168,18 @@ export function startPolling(internalMatchId, cricbuzzMatchId) {
       const event = normalizeBall(latest, internalMatchId);
       await publishEvent(internalMatchId, { ...event, rawBall: latest });
     } catch (err) {
-      console.error(JSON.stringify({ level: 'error', message: 'poll_failed', matchId, error: err.message, timestamp: new Date().toISOString() }));
+      consecutiveErrors++;
+      console.error(JSON.stringify({ level: 'error', message: 'poll_failed', matchId, error: err.message, consecutiveErrors, timestamp: new Date().toISOString() }));
+      // Stop polling if Cricbuzz keeps returning 404 — match is likely finished or ID is invalid
+      if (consecutiveErrors >= MAX_ERRORS) {
+        console.log(JSON.stringify({ level: 'warn', message: 'poll_stopped_too_many_errors', matchId, cricbuzzMatchId, timestamp: new Date().toISOString() }));
+        stopPolling(internalMatchId);
+        // Mark match as finished in DB so it doesn't restart on next sync
+        try {
+          const { eq } = await import('drizzle-orm');
+          await db.update(matches).set({ status: 'finished' }).where(eq(matches.id, internalMatchId));
+        } catch (_) { /* best-effort */ }
+      }
     }
   }, parseInt(process.env.POLL_INTERVAL_MS ?? '15000', 10));
 

@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import http from 'http';
 import express from 'express';
+import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { healthRouter } from './health.js';
 import { matchesRouter } from './routes/matches.js';
@@ -10,6 +11,12 @@ export const app = express();
 export const server = http.createServer(app);
 export const wss = new WebSocketServer({ noServer: true });
 
+// Allow the Vite dev server (and any local origin) to call this API
+app.use(cors({
+  origin: process.env.CORS_ORIGIN ?? '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 app.use(healthRouter);
 app.use('/api', arcjetMiddleware);
