@@ -151,7 +151,7 @@ export function startPolling(internalMatchId, cricbuzzMatchId) {
   }
 
   let consecutiveErrors = 0;
-  const MAX_ERRORS = 5;
+  const MAX_ERRORS = 10; // raised — 404 can mean API tier limit, not match end
 
   const interval = setInterval(async () => {
     const matchId = internalMatchId;
@@ -159,7 +159,7 @@ export function startPolling(internalMatchId, cricbuzzMatchId) {
     try {
       const list = await fetchCommentary(cricbuzzMatchId);
       lastPollTimestamp = new Date().toISOString();
-      consecutiveErrors = 0; // reset on success
+      consecutiveErrors = 0;
       if (!list.length) return;
       const latest = list[0];
       const ballKey = latest.overSep?.balls;
@@ -170,15 +170,11 @@ export function startPolling(internalMatchId, cricbuzzMatchId) {
     } catch (err) {
       consecutiveErrors++;
       console.error(JSON.stringify({ level: 'error', message: 'poll_failed', matchId, error: err.message, consecutiveErrors, timestamp: new Date().toISOString() }));
-      // Stop polling if Cricbuzz keeps returning 404 — match is likely finished or ID is invalid
+      // After too many errors just stop polling this interval — DO NOT mark finished.
+      // syncLiveMatches() is the authority on whether a match is still live.
       if (consecutiveErrors >= MAX_ERRORS) {
-        console.log(JSON.stringify({ level: 'warn', message: 'poll_stopped_too_many_errors', matchId, cricbuzzMatchId, timestamp: new Date().toISOString() }));
+        console.log(JSON.stringify({ level: 'warn', message: 'poll_paused_too_many_errors', matchId, cricbuzzMatchId, timestamp: new Date().toISOString() }));
         stopPolling(internalMatchId);
-        // Mark match as finished in DB so it doesn't restart on next sync
-        try {
-          const { eq } = await import('drizzle-orm');
-          await db.update(matches).set({ status: 'finished' }).where(eq(matches.id, internalMatchId));
-        } catch (_) { /* best-effort */ }
       }
     }
   }, parseInt(process.env.POLL_INTERVAL_MS ?? '15000', 10));
@@ -233,85 +229,140 @@ export async function startPollingAllLiveMatches() {
   }
 }
 
-// syncLiveMatches — auto-discovers live matches from Cricbuzz and upserts them into the DB
-// Called on startup and every SYNC_INTERVAL_MS (default 5 min)
+// syncLiveMatches — auto-discovers live matches from Cricbuzz, upserts them,
+// and marks any DB matches that vanished from the live feed as 'finished'.
+// Called on startup and every SYNC_INTERVAL_MS (default 5 min).
 export async function syncLiveMatches() {
+  const { sql } = await import('drizzle-orm');
+
+  // 1. Remove fake seeded matches (cricbuzzMatchId = 99999) — they pollute the dashboard
   try {
-    const rawMatches = await fetchLiveMatches();
+    await db.execute(sql`DELETE FROM matches WHERE cricbuzz_match_id = 99999`);
+  } catch (_) { /* ignore if already gone */ }
+
+  let rawMatches = [];
+  try {
+    rawMatches = await fetchLiveMatches();
     console.log(JSON.stringify({
       level: 'info',
       message: `syncLiveMatches: found ${rawMatches.length} live match(es) on Cricbuzz`,
       timestamp: new Date().toISOString(),
     }));
+  } catch (err) {
+    console.error(JSON.stringify({
+      level: 'error',
+      message: 'syncLiveMatches: failed to fetch live matches',
+      error: err.message,
+      timestamp: new Date().toISOString(),
+    }));
+    return; // keep existing DB state if Cricbuzz is down
+  }
 
-    for (const raw of rawMatches) {
-      try {
-        const info  = raw.matchInfo;
-        const score = raw.matchScore;
-        if (!info?.matchId) continue;
+  // 2. Upsert every match found in the live feed
+  const liveCricbuzzIds = new Set();
 
-        const cricbuzzMatchId = info.matchId;
-        const homeTeam  = info.team1?.teamSName ?? info.team1?.teamName ?? 'TBD';
-        const awayTeam  = info.team2?.teamSName ?? info.team2?.teamName ?? 'TBD';
-        const series    = info.seriesName ?? null;
-        const format    = normalizeFormat(info.matchFormat);
-        const venue     = info.venue ? `${info.venue.name}, ${info.venue.city}` : null;
-        const startTime = info.startDate ? new Date(parseInt(info.startDate, 10)) : new Date();
+  for (const raw of rawMatches) {
+    try {
+      const info  = raw.matchInfo;
+      const score = raw.matchScore;
+      if (!info?.matchId) continue;
 
-        // Extract scores from matchScore
-        const inn1 = score?.team1Score?.inngs1;
-        const inn2 = score?.team2Score?.inngs1;
-        const homeScore   = inn1?.runs    ?? 0;
-        const homeWickets = inn1?.wickets ?? 0;
-        const homeOvers   = inn1?.overs   != null ? String(inn1.overs) : '0.0';
-        const awayScore   = inn2?.runs    ?? 0;
-        const awayWickets = inn2?.wickets ?? 0;
-        const awayOvers   = inn2?.overs   != null ? String(inn2.overs) : '0.0';
+      const cricbuzzMatchId = info.matchId;
+      liveCricbuzzIds.add(cricbuzzMatchId);
 
-        // Upsert into DB (insert if new, update scores if already exists)
-        const { sql } = await import('drizzle-orm');
-        const result = await db.execute(sql`
-          INSERT INTO matches
-            (sport, home_team, away_team, series_name, match_format, venue,
-             status, cricbuzz_match_id, start_time,
-             home_score, home_wickets, home_overs,
-             away_score, away_wickets, away_overs)
-          VALUES
-            ('cricket', ${homeTeam}, ${awayTeam}, ${series}, ${format}, ${venue},
-             'live', ${cricbuzzMatchId}, ${startTime},
-             ${homeScore}, ${homeWickets}, ${homeOvers},
-             ${awayScore}, ${awayWickets}, ${awayOvers})
-          ON CONFLICT (cricbuzz_match_id) DO UPDATE
-            SET status        = 'live',
-                home_score    = EXCLUDED.home_score,
-                home_wickets  = EXCLUDED.home_wickets,
-                home_overs    = EXCLUDED.home_overs,
-                away_score    = EXCLUDED.away_score,
-                away_wickets  = EXCLUDED.away_wickets,
-                away_overs    = EXCLUDED.away_overs
-          RETURNING id, cricbuzz_match_id, home_team, away_team
-        `);
+      const homeTeam  = info.team1?.teamSName ?? info.team1?.teamName ?? 'TBD';
+      const awayTeam  = info.team2?.teamSName ?? info.team2?.teamName ?? 'TBD';
+      const series    = info.seriesName ?? null;
+      const format    = normalizeFormat(info.matchFormat);
+      const venue     = info.venue
+        ? [info.venue.name, info.venue.city].filter(Boolean).join(', ')
+        : null;
+      const startTime = info.startDate
+        ? new Date(parseInt(info.startDate, 10))
+        : new Date();
 
-        const row = result.rows?.[0];
-        if (!row) continue;
+      // Extract scores — team1Score = home, team2Score = away
+      const t1inn1 = score?.team1Score?.inngs1;
+      const t1inn2 = score?.team1Score?.inngs2;
+      const t2inn1 = score?.team2Score?.inngs1;
+      const t2inn2 = score?.team2Score?.inngs2;
 
-        const internalId = row.id;
+      // Use the most recent innings for each team
+      const t1 = t1inn2 ?? t1inn1;
+      const t2 = t2inn2 ?? t2inn1;
+
+      const homeScore   = t1?.runs    ?? 0;
+      const homeWickets = t1?.wickets ?? 0;
+      const homeOvers   = t1?.overs   != null ? String(t1.overs) : '0.0';
+      const awayScore   = t2?.runs    ?? 0;
+      const awayWickets = t2?.wickets ?? 0;
+      const awayOvers   = t2?.overs   != null ? String(t2.overs) : '0.0';
+
+      const result = await db.execute(sql`
+        INSERT INTO matches
+          (sport, home_team, away_team, series_name, match_format, venue,
+           status, cricbuzz_match_id, start_time,
+           home_score, home_wickets, home_overs,
+           away_score, away_wickets, away_overs)
+        VALUES
+          ('cricket', ${homeTeam}, ${awayTeam}, ${series}, ${format}, ${venue},
+           'live', ${cricbuzzMatchId}, ${startTime},
+           ${homeScore}, ${homeWickets}, ${homeOvers},
+           ${awayScore}, ${awayWickets}, ${awayOvers})
+        ON CONFLICT (cricbuzz_match_id) DO UPDATE
+          SET status        = 'live',
+              home_score    = EXCLUDED.home_score,
+              home_wickets  = EXCLUDED.home_wickets,
+              home_overs    = EXCLUDED.home_overs,
+              away_score    = EXCLUDED.away_score,
+              away_wickets  = EXCLUDED.away_wickets,
+              away_overs    = EXCLUDED.away_overs
+        RETURNING id, cricbuzz_match_id, home_team, away_team
+      `);
+
+      const row = result.rows?.[0];
+      if (!row) continue;
+
+      const internalId = row.id;
+      console.log(JSON.stringify({
+        level: 'info',
+        message: 'syncLiveMatches: upserted match',
+        internalId,
+        cricbuzzMatchId,
+        match: `${homeTeam} vs ${awayTeam}`,
+        scores: `${homeScore}/${homeWickets}(${homeOvers}) vs ${awayScore}/${awayWickets}(${awayOvers})`,
+        timestamp: new Date().toISOString(),
+      }));
+
+      // Restart polling if it was paused due to errors
+      startPolling(internalId, cricbuzzMatchId);
+    } catch (matchErr) {
+      console.error(JSON.stringify({
+        level: 'error',
+        message: 'syncLiveMatches: failed to upsert match',
+        error: matchErr.message,
+        timestamp: new Date().toISOString(),
+      }));
+    }
+  }
+
+  // 3. Mark any DB 'live' matches that are no longer in the Cricbuzz feed as 'finished'
+  //    (Cricbuzz is the source of truth for match status)
+  try {
+    const dbLiveMatches = await db.select().from(matches).where(eq(matches.status, 'live'));
+    for (const m of dbLiveMatches) {
+      if (!m.cricbuzzMatchId) continue; // skip matches with no Cricbuzz ID
+      if (!liveCricbuzzIds.has(m.cricbuzzMatchId)) {
+        await db.update(matches)
+          .set({ status: 'finished' })
+          .where(eq(matches.id, m.id));
+        stopPolling(m.id);
         console.log(JSON.stringify({
           level: 'info',
-          message: 'syncLiveMatches: upserted match',
-          internalId,
-          cricbuzzMatchId,
-          match: `${homeTeam} vs ${awayTeam}`,
-          timestamp: new Date().toISOString(),
-        }));
-
-        // Start polling if not already active
-        startPolling(internalId, cricbuzzMatchId);
-      } catch (matchErr) {
-        console.error(JSON.stringify({
-          level: 'error',
-          message: 'syncLiveMatches: failed to upsert match',
-          error: matchErr.message,
+          message: 'syncLiveMatches: marked match finished (not in live feed)',
+          matchId: m.id,
+          cricbuzzMatchId: m.cricbuzzMatchId,
+          match: `${m.homeTeam} vs ${m.awayTeam}`,
           timestamp: new Date().toISOString(),
         }));
       }
@@ -319,7 +370,7 @@ export async function syncLiveMatches() {
   } catch (err) {
     console.error(JSON.stringify({
       level: 'error',
-      message: 'syncLiveMatches: failed to fetch live matches',
+      message: 'syncLiveMatches: failed to mark finished matches',
       error: err.message,
       timestamp: new Date().toISOString(),
     }));
