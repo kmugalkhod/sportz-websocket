@@ -25,9 +25,12 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
-  const subscriptionsRef = useRef<Map<number, number>>(new Map()); // matchId → lastSequence
+  const subscriptionsRef = useRef<Map<number, number>>(new Map());
+  // Guards against React Strict Mode double-invoke and stale closures
+  const unmountedRef = useRef(false);
 
   const connect = useCallback(() => {
+    if (unmountedRef.current) return;
     if (
       wsRef.current?.readyState === WebSocket.OPEN ||
       wsRef.current?.readyState === WebSocket.CONNECTING
@@ -36,6 +39,7 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const ws = new WebSocket('ws://localhost:8000/ws');
 
     ws.onopen = () => {
+      if (unmountedRef.current) { ws.close(); return; }
       setIsConnected(true);
       reconnectAttemptsRef.current = 0;
       subscriptionsRef.current.forEach((lastSequence, matchId) => {
@@ -44,6 +48,7 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
 
     ws.onmessage = (event) => {
+      if (unmountedRef.current) return;
       try {
         const data = JSON.parse(event.data as string);
         if (data.type === 'ball_event') {
@@ -63,6 +68,8 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     ws.onclose = () => {
       setIsConnected(false);
       wsRef.current = null;
+      // Don't reconnect if the component has unmounted (Strict Mode cleanup or real unmount)
+      if (unmountedRef.current) return;
       const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000);
       reconnectAttemptsRef.current += 1;
       reconnectTimeoutRef.current = setTimeout(connect, delay);
@@ -74,10 +81,19 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   useEffect(() => {
+    unmountedRef.current = false;
     connect();
+
     return () => {
+      // Mark as unmounted FIRST so onclose doesn't schedule a reconnect
+      unmountedRef.current = true;
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      wsRef.current?.close();
+      // Force-close any in-progress connection
+      const ws = wsRef.current;
+      if (ws) {
+        wsRef.current = null;
+        ws.close();
+      }
     };
   }, [connect]);
 

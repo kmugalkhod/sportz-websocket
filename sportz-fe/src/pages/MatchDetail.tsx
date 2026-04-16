@@ -44,6 +44,19 @@ export default function MatchDetail() {
     loadData();
   }, [loadData]);
 
+  // REST score polling fallback — refreshes match scores every 30s from the
+  // REST API in case WebSocket score_update events aren't arriving
+  useEffect(() => {
+    if (!matchId) return;
+    const interval = setInterval(async () => {
+      try {
+        const fresh = await fetchMatch(matchId);
+        setMatch(fresh);
+      } catch { /* silent — WS is primary */ }
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [matchId]);
+
   // Subscribe / unsubscribe WebSocket
   useEffect(() => {
     if (!matchId) return;

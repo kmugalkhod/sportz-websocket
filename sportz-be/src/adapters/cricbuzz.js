@@ -397,7 +397,9 @@ export async function syncLiveMatches() {
               away_score    = EXCLUDED.away_score,
               away_wickets  = EXCLUDED.away_wickets,
               away_overs    = EXCLUDED.away_overs
-        RETURNING id, cricbuzz_match_id, home_team, away_team
+        RETURNING id, cricbuzz_match_id, home_team, away_team,
+                  home_score, home_wickets, home_overs,
+                  away_score, away_wickets, away_overs
       `);
 
       const row = result.rows?.[0];
@@ -413,6 +415,26 @@ export async function syncLiveMatches() {
         scores: `${homeScore}/${homeWickets}(${homeOvers}) vs ${awayScore}/${awayWickets}(${awayOvers})`,
         timestamp: new Date().toISOString(),
       }));
+
+      // Broadcast score_update so connected clients get fresh scores from
+      // the live feed even when the dedicated score/commentary endpoints are unavailable
+      try {
+        const { broadcastToMatch } = await import('../websocket/broadcaster.js');
+        // Determine which team is currently batting (the one with fewer overs)
+        const homeParsed = parseFloat(homeOvers);
+        const awayParsed = parseFloat(awayOvers);
+        const homeBatting = homeParsed < awayParsed || awayParsed === 0;
+        const battingScore = homeBatting
+          ? { runs: homeScore, wickets: homeWickets, overs: homeOvers, battingTeam: homeTeam }
+          : { runs: awayScore, wickets: awayWickets, overs: awayOvers, battingTeam: awayTeam };
+
+        broadcastToMatch(internalId, {
+          type: 'score_update',
+          timestamp: new Date().toISOString(),
+          matchId: internalId,
+          score: { ...battingScore, runRate: 0, inningsNum: homeBatting ? 1 : 2 },
+        });
+      } catch (_) { /* broadcaster not ready yet on first sync */ }
 
       // Restart pollers if they were paused due to errors
       startPolling(internalId, cricbuzzMatchId);
