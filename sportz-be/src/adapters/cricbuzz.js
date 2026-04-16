@@ -137,6 +137,85 @@ export async function fetchScore(cricbuzzMatchId) {
   };
 }
 
+// ── Score-only poller ──────────────────────────────────────────────────────
+// Calls fetchScore() every SCORE_POLL_MS for each live match and broadcasts
+// score_update via WebSocket. Runs independently of commentary polling so
+// scores stay fresh even when the commentary endpoint is unavailable.
+const scorePollers = new Map(); // Map<internalMatchId, intervalId>
+const SCORE_POLL_MS = parseInt(process.env.SCORE_POLL_MS ?? '30000', 10);
+
+export function startScorePolling(internalMatchId, cricbuzzMatchId) {
+  if (scorePollers.has(internalMatchId)) return;
+  if (!cricbuzzMatchId || cricbuzzMatchId === 99999) return;
+
+  // Track last seen score to avoid broadcasting identical values
+  let lastScoreKey = '';
+
+  const interval = setInterval(async () => {
+    try {
+      const score = await fetchScore(cricbuzzMatchId);
+
+      const scoreKey = `${score.runs}/${score.wickets}/${score.overs}`;
+      if (scoreKey === lastScoreKey) return; // no change
+      lastScoreKey = scoreKey;
+
+      const { broadcastToMatch: broadcast } = await import('../websocket/broadcaster.js');
+
+      // Determine which team is batting and update the correct columns
+      const { eq } = await import('drizzle-orm');
+      const [match] = await db.select().from(matches).where(eq(matches.id, internalMatchId));
+      if (!match) return;
+
+      const homeBatting = score.battingTeam === match.homeTeam;
+      if (homeBatting) {
+        await db.update(matches).set({
+          homeScore:   score.runs,
+          homeWickets: score.wickets,
+          homeOvers:   score.overs,
+        }).where(eq(matches.id, internalMatchId));
+      } else {
+        await db.update(matches).set({
+          awayScore:   score.runs,
+          awayWickets: score.wickets,
+          awayOvers:   score.overs,
+        }).where(eq(matches.id, internalMatchId));
+      }
+
+      broadcast(internalMatchId, {
+        type: 'score_update',
+        timestamp: new Date().toISOString(),
+        matchId: internalMatchId,
+        score,
+      });
+
+      console.log(JSON.stringify({
+        level: 'info',
+        message: 'score_update_broadcast',
+        matchId: internalMatchId,
+        score: scoreKey,
+        battingTeam: score.battingTeam,
+        timestamp: new Date().toISOString(),
+      }));
+    } catch (err) {
+      // 404 = score endpoint unavailable; log once quietly
+      if (!err.message?.includes('404')) {
+        console.error(JSON.stringify({ level: 'error', message: 'score_poll_failed', matchId: internalMatchId, error: err.message, timestamp: new Date().toISOString() }));
+      }
+    }
+  }, SCORE_POLL_MS);
+
+  scorePollers.set(internalMatchId, interval);
+  console.log(JSON.stringify({ level: 'info', message: 'score_polling_started', matchId: internalMatchId, intervalMs: SCORE_POLL_MS, timestamp: new Date().toISOString() }));
+}
+
+export function stopScorePolling(internalMatchId) {
+  const interval = scorePollers.get(internalMatchId);
+  if (interval) {
+    clearInterval(interval);
+    scorePollers.delete(internalMatchId);
+  }
+}
+
 // T019 — startPolling / stopPolling
 const activePollers = new Map(); // Map<matchId, intervalId>
 let lastPollTimestamp = null;
@@ -205,6 +284,7 @@ export async function startPollingAllLiveMatches() {
     for (const match of liveMatches) {
       if (match.cricbuzzMatchId) {
         startPolling(match.id, match.cricbuzzMatchId);
+        startScorePolling(match.id, match.cricbuzzMatchId);
         console.log(JSON.stringify({
           level: 'info',
           message: 'Polling started',
@@ -334,8 +414,9 @@ export async function syncLiveMatches() {
         timestamp: new Date().toISOString(),
       }));
 
-      // Restart polling if it was paused due to errors
+      // Restart pollers if they were paused due to errors
       startPolling(internalId, cricbuzzMatchId);
+      startScorePolling(internalId, cricbuzzMatchId);
     } catch (matchErr) {
       console.error(JSON.stringify({
         level: 'error',
@@ -357,6 +438,7 @@ export async function syncLiveMatches() {
           .set({ status: 'finished' })
           .where(eq(matches.id, m.id));
         stopPolling(m.id);
+        stopScorePolling(m.id);
         console.log(JSON.stringify({
           level: 'info',
           message: 'syncLiveMatches: marked match finished (not in live feed)',

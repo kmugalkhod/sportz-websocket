@@ -69,10 +69,19 @@ export default function MatchDetail() {
   }, [lastScoreUpdate, matchId]);
 
   // ── Derived ────────────────────────────────────────────────────
-  const currentOver =
-    liveScore?.overs ??
-    (match?.homeScore ? match.homeOvers : match?.awayOvers) ??
-    '0.0';
+  // Use liveScore.overs (the batting team's current overs) when available.
+  // Fall back to the team that has fewer overs (still batting), not the one
+  // that completed 20 overs — avoids "Over 20" being shown for 2nd innings.
+  const currentOver = liveScore?.overs ?? (() => {
+    if (!match) return '0.0';
+    const ho = parseFloat(match.homeOvers);
+    const ao = parseFloat(match.awayOvers);
+    // Pick whichever innings is still in progress (overs < 20 for T20)
+    if (ao > 0 && ao < 20) return match.awayOvers;
+    if (ho > 0 && ho < 20) return match.homeOvers;
+    // Both complete or neither started — show away overs (2nd innings default)
+    return match.awayOvers;
+  })();
 
   if (loading) return <LoadingSkeleton />;
   if (error || !match) return <ErrorState message={error ?? 'Match not found'} />;
